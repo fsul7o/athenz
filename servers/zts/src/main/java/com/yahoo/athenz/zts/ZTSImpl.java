@@ -201,6 +201,7 @@ public class ZTSImpl implements ZTSHandler {
     protected String ztsMetricLatencyName;
     protected String userCertProvider;
     protected boolean validateRoleCertDnsNames = false;
+    protected DynamicConfigBoolean delegatedInstanceRegister;
     private UserIdentityTimeout userIdentityTimeoutManager;
 
     private static final String TYPE_DOMAIN_NAME = "DomainName";
@@ -798,6 +799,9 @@ public class ZTSImpl implements ZTSHandler {
 
         instanceRegisterTokenTypeJWT = Boolean.parseBoolean(
                 System.getProperty(ZTSConsts.ZTS_PROP_CERT_REQUEST_TOKEN_TYPE_JWT, "false"));
+
+        delegatedInstanceRegister = new DynamicConfigBoolean(CONFIG_MANAGER,
+            ZTSConsts.ZTS_PROP_DELEGATED_INSTANCE_REGISTER, false);
 
         // check if we should use the user cert provider
 
@@ -4357,6 +4361,65 @@ public class ZTSImpl implements ZTSHandler {
         return (authorizedService != null && !authorizedService.isEmpty());
     }
 
+    String getServicePrincipalName(final String domain, final String service) {
+        return domain + "." + service;
+    }
+
+    boolean isDelegatedInstanceRegisterRequest(final Principal principal, final String domain,
+            final String service) {
+
+        if (principal == null) {
+            return false;
+        }
+
+        final String principalName = principal.getFullName();
+        return !StringUtil.isEmpty(principalName)
+                && !getServicePrincipalName(domain, service).equals(principalName);
+    }
+
+    void addInstanceRequestPrincipalAttributes(final Map<String, String> attributes,
+            final Principal principal, final String domain, final String service) {
+
+        final String targetPrincipal = getServicePrincipalName(domain, service);
+        attributes.put(InstanceProvider.ZTS_REQUEST_TARGET_PRINCIPAL, targetPrincipal);
+        attributes.put(InstanceProvider.ZTS_REQUEST_IS_DELEGATED,
+                Boolean.toString(isDelegatedInstanceRegisterRequest(principal, domain, service)));
+
+        if (principal != null && !StringUtil.isEmpty(principal.getFullName())) {
+            attributes.put(InstanceProvider.ZTS_REQUEST_PRINCIPAL, principal.getFullName());
+        }
+    }
+
+    void authorizeDelegatedInstanceRegister(final Principal principal, final String domain,
+            final String service, final String caller, final String principalDomain) {
+
+        if (!isDelegatedInstanceRegisterRequest(principal, domain, service)) {
+            return;
+        }
+
+        final String principalName = principal.getFullName();
+
+        validatePrincipalNotRoleIdentity(principal, caller);
+
+        if (!delegatedInstanceRegister.get()) {
+            throw forbiddenError("Delegated instance register is not enabled",
+                    caller, domain, principalDomain);
+        }
+
+        if (!(principal.getAuthority() instanceof CertificateAuthority)
+                || principalName.startsWith(userDomainPrefix)) {
+            throw requestError("Delegated instance register requires mTLS service principal",
+                    caller, domain, principalDomain);
+        }
+
+        final String resource = domain + ":service." + service;
+        if (!authorizer.access("delegate", resource, principal, null)) {
+            throw forbiddenError("Principal: " + principalName
+                    + " not authorized for delegated instance register",
+                    caller, domain, principalDomain);
+        }
+    }
+
     public AWSTemporaryCredentials getAWSTemporaryCredentials(ResourceContext ctx, String domainName,
             String roleName, Integer durationSeconds, String externalId) {
 
@@ -4617,10 +4680,8 @@ public class ZTSImpl implements ZTSHandler {
         Map<String, String> attributes = new HashMap<>();
         attributes.put(InstanceProvider.ZTS_INSTANCE_CLIENT_IP, ServletRequestUtil.getRemoteAddress(ctx.request()));
 
-        // include the principal from the request object
-
         final Principal principal = ((RsrcCtxWrapper) ctx).principal();
-        attributes.put(InstanceProvider.ZTS_REQUEST_PRINCIPAL, principal.getFullName());
+        addInstanceRequestPrincipalAttributes(attributes, principal, domain, service);
         attributes.put(InstanceProvider.ZTS_INSTANCE_ID, instanceId);
 
         InstanceConfirmation instance = new InstanceConfirmation()
@@ -4710,6 +4771,9 @@ public class ZTSImpl implements ZTSHandler {
         if (!instanceCertManager.authorizeLaunch(providerService, domain, service, errorMsg)) {
             throw forbiddenError(errorMsg.toString(), caller, domain, principalDomain);
         }
+
+        authorizeDelegatedInstanceRegister(((RsrcCtxWrapper) ctx).principal(), domain, service,
+                caller, principalDomain);
 
         if (StringUtil.isEmpty(info.getCsr())) {
             return postInstanceJWTRegister(ctx, info, domain, service, cn, principalDomain, domainData,
@@ -5279,9 +5343,7 @@ public class ZTSImpl implements ZTSHandler {
         // we're going to include the principal if we have one in our request
 
         final Principal principal = ((RsrcCtxWrapper) ctx).principal();
-        if (principal != null) {
-            attributes.put(InstanceProvider.ZTS_REQUEST_PRINCIPAL, principal.getFullName());
-        }
+        addInstanceRequestPrincipalAttributes(attributes, principal, domain, service);
 
         if (!StringUtil.isEmpty(cloud)) {
             attributes.put(InstanceProvider.ZTS_INSTANCE_CLOUD, cloud);

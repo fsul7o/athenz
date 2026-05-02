@@ -273,6 +273,7 @@ public class ZTSImplTest {
         ZTSTestUtils.deleteDirectory(new File(ZTS_DATA_STORE_PATH));
         System.clearProperty(ZTSConsts.ZTS_PROP_ROLE_TOKEN_MAX_TIMEOUT);
         System.clearProperty(ZTSConsts.ZTS_PROP_ROLE_TOKEN_DEFAULT_TIMEOUT);
+                System.clearProperty(ZTSConsts.ZTS_PROP_DELEGATED_INSTANCE_REGISTER);
         ZTSUtils.ZTS_CERT_INSTANCE_ID_DNS_NAMES.remove(".instanceid.athenz.zts.athenz.cloud");
         ZTSUtils.ZTS_CERT_INSTANCE_ID_DNS_NAMES.remove(".instanceid.athenz.ostk.athenz.cloud");
     }
@@ -4937,6 +4938,12 @@ public class ZTSImplTest {
     private SignedDomain signedBootstrapTenantDomain(String provider, String domainName,
             String serviceName, String awsAccount) {
 
+        return signedBootstrapTenantDomain(provider, domainName, serviceName, awsAccount, null);
+    }
+
+    private SignedDomain signedBootstrapTenantDomain(String provider, String domainName,
+            String serviceName, String awsAccount, String delegatePrincipal) {
+
         SignedDomain signedDomain = new SignedDomain();
 
         List<Role> roles = new ArrayList<>();
@@ -4963,6 +4970,24 @@ public class ZTSImplTest {
         policy.setName(generatePolicyName(domainName, "providers"));
         policies.add(policy);
 
+                if (delegatePrincipal != null) {
+                        Role delegateRole = new Role();
+                        delegateRole.setName(ResourceUtils.roleResourceName(domainName, "delegate-agents"));
+                        List<RoleMember> delegateMembers = new ArrayList<>();
+                        delegateMembers.add(new RoleMember().setMemberName(delegatePrincipal));
+                        delegateRole.setRoleMembers(delegateMembers);
+                        roles.add(delegateRole);
+
+                        com.yahoo.athenz.zms.Policy delegatePolicy = new com.yahoo.athenz.zms.Policy();
+                        com.yahoo.athenz.zms.Assertion delegateAssertion = new com.yahoo.athenz.zms.Assertion();
+                        delegateAssertion.setResource(domainName + ":service." + serviceName);
+                        delegateAssertion.setAction("delegate");
+                        delegateAssertion.setRole(ResourceUtils.roleResourceName(domainName, "delegate-agents"));
+                        delegatePolicy.setAssertions(Collections.singletonList(delegateAssertion));
+                        delegatePolicy.setName(generatePolicyName(domainName, "delegation"));
+                        policies.add(delegatePolicy);
+                }
+
         com.yahoo.athenz.zms.DomainPolicies domainPolicies = new com.yahoo.athenz.zms.DomainPolicies();
         domainPolicies.setDomain(domainName);
         domainPolicies.setPolicies(policies);
@@ -4986,6 +5011,12 @@ public class ZTSImplTest {
 
         return signedDomain;
     }
+
+        private Principal createMtlsServicePrincipal(String domain, String service) {
+                return SimplePrincipal.create(domain, service,
+                                "v=S1;d=" + domain + ";n=" + service + ";s=signature", 0,
+                                new CertificateAuthority());
+        }
 
     @Test
     public void testPostInstanceRegisterInformation() throws IOException, ProviderResourceException {
@@ -5048,6 +5079,183 @@ public class ZTSImplTest {
         InstanceIdentity resIdentity = (InstanceIdentity) response.getEntity();
         assertNotNull(resIdentity.getX509Certificate());
         ztsImpl.enableWorkloadStore = false;
+    }
+
+    @Test
+    public void testPostInstanceRegisterInformationDelegated() throws IOException, ProviderResourceException {
+
+        System.setProperty(ZTSConsts.ZTS_PROP_DELEGATED_INSTANCE_REGISTER, "true");
+
+        ChangeLogStore structStore = new ZMSFileChangeLogStore("/tmp/zts_server_unit_tests/zts_root",
+                privateKey, "0");
+
+        DataStore store = new DataStore(structStore, null, ztsMetric);
+        ZTSImpl ztsImpl = new ZTSImpl(mockCloudStore, store);
+
+        SignedDomain providerDomain = ZTSTestUtils.signedAuthorizedProviderDomain(privateKey);
+        store.processSignedDomain(providerDomain, false);
+
+        SignedDomain tenantDomain = signedBootstrapTenantDomain("athenz.provider", "athenz",
+                "production", null, "delegate.agent");
+        store.processSignedDomain(tenantDomain, false);
+
+        Path path = Paths.get("src/test/resources/athenz.instanceid.csr");
+        String certCsr = new String(Files.readAllBytes(path));
+
+        InstanceProviderManager instanceProviderManager = Mockito.mock(InstanceProviderManager.class);
+        InstanceProvider providerClient = Mockito.mock(InstanceProvider.class);
+        Mockito.when(providerClient.getProviderScheme()).thenReturn(InstanceProvider.Scheme.CLASS);
+        Mockito.when(providerClient.getSVIDType()).thenReturn(InstanceProvider.SVIDType.X509);
+
+        InstanceConfirmation confirmation = new InstanceConfirmation()
+                .setDomain("athenz").setService("production").setProvider("athenz.provider")
+                .setAttributes(new HashMap<>());
+
+        InstanceCertManager instanceManager = Mockito.spy(ztsImpl.instanceCertManager);
+        Mockito.when(instanceProviderManager.getProvider(eq("athenz.provider"), Mockito.any(), Mockito.any()))
+                .thenReturn(providerClient);
+        Mockito.when(providerClient.confirmInstance(Mockito.any())).thenReturn(confirmation);
+        Mockito.when(instanceManager.insertX509CertRecord(Mockito.any())).thenReturn(true);
+
+        path = Paths.get("src/test/resources/athenz.instanceid.pem");
+        String pem = new String(Files.readAllBytes(path));
+
+        InstanceIdentity identity = new InstanceIdentity().setName("athenz.production")
+                .setX509Certificate(pem);
+        Mockito.doReturn(identity).when(instanceManager).generateIdentity(Mockito.any(), Mockito.any(),
+                Mockito.any(), Mockito.any(), Mockito.any(), Mockito.anyInt(), Mockito.any(), Mockito.any());
+
+        ztsImpl.instanceProviderManager = instanceProviderManager;
+        ztsImpl.instanceCertManager = instanceManager;
+
+        InstanceRegisterInformation info = new InstanceRegisterInformation()
+                .setAttestationData("attestationData").setCsr(certCsr)
+                .setDomain("athenz").setService("production")
+                .setProvider("athenz.provider");
+
+        ResourceContext context = createResourceContext(createMtlsServicePrincipal("delegate", "agent"));
+
+        Response response = ztsImpl.postInstanceRegisterInformation(context, info);
+        assertEquals(response.getStatus(), 201);
+        InstanceIdentity resIdentity = (InstanceIdentity) response.getEntity();
+        assertEquals(resIdentity.getName(), "athenz.production");
+
+                ArgumentCaptor<InstanceConfirmation> confirmationCaptor = ArgumentCaptor.forClass(InstanceConfirmation.class);
+                Mockito.verify(providerClient).confirmInstance(confirmationCaptor.capture());
+                Map<String, String> requestAttrs = confirmationCaptor.getValue().getAttributes();
+                assertEquals(requestAttrs.get(InstanceProvider.ZTS_REQUEST_PRINCIPAL), "delegate.agent");
+                assertEquals(requestAttrs.get(InstanceProvider.ZTS_REQUEST_TARGET_PRINCIPAL), "athenz.production");
+                assertEquals(requestAttrs.get(InstanceProvider.ZTS_REQUEST_IS_DELEGATED), Boolean.TRUE.toString());
+    }
+
+    @Test
+    public void testPostInstanceRegisterInformationDelegatedDisabled() throws IOException {
+
+        ChangeLogStore structStore = new ZMSFileChangeLogStore("/tmp/zts_server_unit_tests/zts_root",
+                privateKey, "0");
+
+        DataStore store = new DataStore(structStore, null, ztsMetric);
+        ZTSImpl ztsImpl = new ZTSImpl(mockCloudStore, store);
+
+        SignedDomain providerDomain = ZTSTestUtils.signedAuthorizedProviderDomain(privateKey);
+        store.processSignedDomain(providerDomain, false);
+
+        SignedDomain tenantDomain = signedBootstrapTenantDomain("athenz.provider", "athenz",
+                "production", null, "delegate.agent");
+        store.processSignedDomain(tenantDomain, false);
+
+        Path path = Paths.get("src/test/resources/athenz.instanceid.csr");
+        String certCsr = new String(Files.readAllBytes(path));
+
+        InstanceRegisterInformation info = new InstanceRegisterInformation()
+                .setAttestationData("attestationData").setCsr(certCsr)
+                .setDomain("athenz").setService("production")
+                .setProvider("athenz.provider");
+
+        ResourceContext context = createResourceContext(createMtlsServicePrincipal("delegate", "agent"));
+
+        try {
+            ztsImpl.postInstanceRegisterInformation(context, info);
+            fail();
+        } catch (ResourceException ex) {
+            assertEquals(ex.getCode(), 403);
+            assertTrue(ex.getMessage().contains("Delegated instance register is not enabled"));
+        }
+    }
+
+    @Test
+    public void testPostInstanceRegisterInformationDelegatedUnauthorized() throws IOException {
+
+        System.setProperty(ZTSConsts.ZTS_PROP_DELEGATED_INSTANCE_REGISTER, "true");
+
+        ChangeLogStore structStore = new ZMSFileChangeLogStore("/tmp/zts_server_unit_tests/zts_root",
+                privateKey, "0");
+
+        DataStore store = new DataStore(structStore, null, ztsMetric);
+        ZTSImpl ztsImpl = new ZTSImpl(mockCloudStore, store);
+
+        SignedDomain providerDomain = ZTSTestUtils.signedAuthorizedProviderDomain(privateKey);
+        store.processSignedDomain(providerDomain, false);
+
+        SignedDomain tenantDomain = signedBootstrapTenantDomain("athenz.provider", "athenz", "production");
+        store.processSignedDomain(tenantDomain, false);
+
+        Path path = Paths.get("src/test/resources/athenz.instanceid.csr");
+        String certCsr = new String(Files.readAllBytes(path));
+
+        InstanceRegisterInformation info = new InstanceRegisterInformation()
+                .setAttestationData("attestationData").setCsr(certCsr)
+                .setDomain("athenz").setService("production")
+                .setProvider("athenz.provider");
+
+        ResourceContext context = createResourceContext(createMtlsServicePrincipal("delegate", "agent"));
+
+        try {
+            ztsImpl.postInstanceRegisterInformation(context, info);
+            fail();
+        } catch (ResourceException ex) {
+            assertEquals(ex.getCode(), 403);
+            assertTrue(ex.getMessage().contains("not authorized for delegated instance register"));
+        }
+    }
+
+    @Test
+    public void testPostInstanceRegisterInformationDelegatedRequiresMtlsServicePrincipal() throws IOException {
+
+        System.setProperty(ZTSConsts.ZTS_PROP_DELEGATED_INSTANCE_REGISTER, "true");
+
+        ChangeLogStore structStore = new ZMSFileChangeLogStore("/tmp/zts_server_unit_tests/zts_root",
+                privateKey, "0");
+
+        DataStore store = new DataStore(structStore, null, ztsMetric);
+        ZTSImpl ztsImpl = new ZTSImpl(mockCloudStore, store);
+
+        SignedDomain providerDomain = ZTSTestUtils.signedAuthorizedProviderDomain(privateKey);
+        store.processSignedDomain(providerDomain, false);
+
+        SignedDomain tenantDomain = signedBootstrapTenantDomain("athenz.provider", "athenz",
+                "production", null, "delegate.agent");
+        store.processSignedDomain(tenantDomain, false);
+
+        Path path = Paths.get("src/test/resources/athenz.instanceid.csr");
+        String certCsr = new String(Files.readAllBytes(path));
+
+        Principal principal = SimplePrincipal.create("delegate", "agent",
+                "v=S1;d=delegate;n=agent;s=signature", 0, null);
+        ResourceContext context = createResourceContext(principal);
+
+        InstanceRegisterInformation info = new InstanceRegisterInformation()
+                .setAttestationData("attestationData").setCsr(certCsr)
+                .setDomain("athenz").setService("production")
+                .setProvider("athenz.provider");
+
+        try {
+            ztsImpl.postInstanceRegisterInformation(context, info);
+            fail();
+        } catch (ResourceException ex) {
+            assertEquals(ex.getCode(), 400);
+            assertTrue(ex.getMessage().contains("requires mTLS service principal"));
+        }
     }
 
     @Test
@@ -5963,7 +6171,6 @@ public class ZTSImplTest {
             assertEquals(ex.getCode(), 504);
             assertTrue(ex.getMessage().contains("Connect Timeout"));
         }
-
         // then 403
 
         try {
@@ -5974,6 +6181,37 @@ public class ZTSImplTest {
             assertTrue(ex.getMessage().contains("Instance Revoked"));
         }
     }
+
+        @Test
+        public void testGenerateInstanceConfirmObjectSelfServiceAttributes() {
+
+                Principal principal = createMtlsServicePrincipal("athenz", "production");
+                ResourceContext context = createResourceContext(principal);
+
+                InstanceConfirmation confirmation = zts.generateInstanceConfirmObject(context, "athenz.provider",
+                                "athenz", "production", "attestation-data", "instance-id", "host.example", null,
+                                null, InstanceProvider.Scheme.CLASS, null, null, null);
+
+                Map<String, String> attrs = confirmation.getAttributes();
+                assertEquals(attrs.get(InstanceProvider.ZTS_REQUEST_PRINCIPAL), "athenz.production");
+                assertEquals(attrs.get(InstanceProvider.ZTS_REQUEST_TARGET_PRINCIPAL), "athenz.production");
+                assertEquals(attrs.get(InstanceProvider.ZTS_REQUEST_IS_DELEGATED), Boolean.FALSE.toString());
+        }
+
+        @Test
+        public void testGenerateInstanceConfirmObjectAnonymousAttributes() {
+
+                ResourceContext context = createResourceContext(null);
+
+                InstanceConfirmation confirmation = zts.generateInstanceConfirmObject(context, "athenz.provider",
+                                "athenz", "production", "attestation-data", "instance-id", "host.example", null,
+                                null, InstanceProvider.Scheme.CLASS, null, null, null);
+
+                Map<String, String> attrs = confirmation.getAttributes();
+                assertNull(attrs.get(InstanceProvider.ZTS_REQUEST_PRINCIPAL));
+                assertEquals(attrs.get(InstanceProvider.ZTS_REQUEST_TARGET_PRINCIPAL), "athenz.production");
+                assertEquals(attrs.get(InstanceProvider.ZTS_REQUEST_IS_DELEGATED), Boolean.FALSE.toString());
+        }
 
     @Test
     public void testPostInstanceRegisterInformationNoAuthorizedProvider() throws IOException {
@@ -11888,6 +12126,13 @@ public class ZTSImplTest {
         InstanceRegisterToken registerToken = ztsImpl.getInstanceRegisterToken(context, "sys.auth.zts",
                 "athenz", "production", "id001");
         assertNotNull(registerToken);
+
+        ArgumentCaptor<InstanceConfirmation> confirmationCaptor = ArgumentCaptor.forClass(InstanceConfirmation.class);
+        Mockito.verify(providerClient).getInstanceRegisterToken(confirmationCaptor.capture());
+        Map<String, String> requestAttrs = confirmationCaptor.getValue().getAttributes();
+        assertEquals(requestAttrs.get(InstanceProvider.ZTS_REQUEST_PRINCIPAL), "athenz.production");
+        assertEquals(requestAttrs.get(InstanceProvider.ZTS_REQUEST_TARGET_PRINCIPAL), "athenz.production");
+        assertEquals(requestAttrs.get(InstanceProvider.ZTS_REQUEST_IS_DELEGATED), Boolean.FALSE.toString());
 
         // other service entry will return unauthorized launch
 

@@ -62,6 +62,8 @@ public interface InstanceProvider {
     String ZTS_INSTANCE_CSR_PUBLIC_KEY              = "csrPublicKey";
     String ZTS_INSTANCE_HOSTNAME                    = "hostname";
     String ZTS_REQUEST_PRINCIPAL                    = "principal";
+    String ZTS_REQUEST_TARGET_PRINCIPAL             = "targetPrincipal";
+    String ZTS_REQUEST_IS_DELEGATED                 = "delegatedRequest";
     String ZTS_INSTANCE_PRIVATE_IP                  = "instancePrivateIp";
     String ZTS_INSTANCE_AWS_ACCOUNT                 = "awsAccount";
     String ZTS_INSTANCE_AZURE_SUBSCRIPTION          = "azureSubscription";
